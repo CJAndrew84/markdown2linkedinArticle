@@ -1,0 +1,1464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Markdown → Rich HTML · for LinkedIn Articles & Newsletters</title>
+<!--
+  ============================================================================
+  Markdown → Rich HTML
+  ----------------------------------------------------------------------------
+  A single-file, zero-dependency tool that turns Markdown into rich HTML you
+  can PASTE (as formatted content) into a LinkedIn Article editor, or COPY as
+  raw HTML for newsletter / email tools.
+
+  No build step. No server. No frameworks. No CDN libraries.
+  Just open this file in a browser.
+
+  The pipeline is:
+      Markdown text
+        -> mdToHtml()        : hand-written parser -> neutral semantic HTML
+        -> sanitize()        : DOMParser + tag/attr allow-list
+        -> serialize per MODE:
+             LINKEDIN  -> clean semantic tags, minimal inline style
+             NEWSLETTER-> email-safe HTML, inline styles, 600px table shell
+
+  Why a hand-written parser instead of a CDN lib (marked/markdown-it)?
+  Because the brief says "work locally by opening index.html directly". A CDN
+  dependency breaks offline. So the markdown engine lives in this file.
+
+  MERMAID is the one exception: it's a whole diagramming engine and cannot be
+  hand-rolled. It's loaded lazily, and ONLY if your document contains a
+  ```mermaid block. Load order: local "mermaid.min.js" next to this file first
+  (for full offline use), then a CDN fallback. If neither loads, mermaid blocks
+  degrade gracefully to code blocks. Diagrams are rasterised to PNG because
+  LinkedIn Articles and email clients strip inline SVG.
+  ============================================================================
+-->
+<style>
+  /* ---------------------------------------------------------------------- */
+  /* Design tokens                                                          */
+  /* Tool, not a brochure. Calm paper surfaces, ink text, one teal accent.  */
+  /* System font stacks only (offline-safe — no webfonts).                  */
+  /* ---------------------------------------------------------------------- */
+  :root {
+    --bg:        #f4f3ee;   /* warm paper backdrop                          */
+    --surface:   #ffffff;   /* pane surfaces                               */
+    --surface-2: #faf9f5;   /* editor surface                              */
+    --ink:       #1c1b19;   /* primary text                                */
+    --muted:     #6b6a64;   /* secondary text                              */
+    --line:      #e1ded6;   /* hairline borders                            */
+    --line-2:    #cfccc2;   /* stronger borders                            */
+    --accent:    #0e6b5c;   /* deep teal — the one accent                  */
+    --accent-ink:#0a4e43;
+    --accent-bg: #e4f0ed;
+    --danger:    #a23b2d;
+    --code-bg:   #f1efe9;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --radius: 8px;
+    --shadow: 0 1px 2px rgba(28,27,25,.04), 0 4px 16px rgba(28,27,25,.05);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    color: var(--ink);
+    background: var(--bg);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ------------------------------- Toolbar ------------------------------ */
+  header {
+    position: sticky; top: 0; z-index: 30;
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 18px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+    flex-wrap: wrap;
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; margin-right: auto; }
+  .brand .mark {
+    font-family: var(--mono); font-weight: 700; letter-spacing: -.5px;
+    color: var(--accent); font-size: 18px;
+  }
+  .brand .mark .arrow { color: var(--muted); }
+  .brand .sub { color: var(--muted); font-size: 12.5px; }
+  @media (max-width: 720px) { .brand .sub { display:none; } }
+
+  /* Segmented mode toggle */
+  .modes { display: inline-flex; border: 1px solid var(--line-2); border-radius: var(--radius); overflow: hidden; }
+  .modes button {
+    appearance: none; border: 0; background: var(--surface);
+    padding: 8px 14px; font: inherit; font-size: 13px; cursor: pointer;
+    color: var(--muted); border-right: 1px solid var(--line);
+  }
+  .modes button:last-child { border-right: 0; }
+  .modes button[aria-pressed="true"] { background: var(--accent); color: #fff; font-weight: 600; }
+
+  .btn {
+    appearance: none; font: inherit; font-size: 13px; cursor: pointer;
+    padding: 8px 13px; border-radius: var(--radius);
+    border: 1px solid var(--line-2); background: var(--surface); color: var(--ink);
+    display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent-ink); }
+  .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+  .btn.primary:hover { background: var(--accent-ink); color: #fff; }
+  .btn.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+  .btn.ghost:hover { color: var(--danger); border-color: transparent; }
+  .toolbar-group { display: inline-flex; gap: 8px; flex-wrap: wrap; }
+
+  /* ------------------------------- Layout ------------------------------- */
+  main {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 1px;
+    background: var(--line);
+    height: calc(100vh - 57px);
+    min-height: 0;
+  }
+  .pane { background: var(--surface); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .pane-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 14px; border-bottom: 1px solid var(--line);
+    background: var(--surface-2);
+  }
+  .pane-head h2 {
+    margin: 0; font-size: 12px; font-weight: 700; letter-spacing: .04em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .pane-head .right { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+  .pane-body { flex: 1 1 auto; overflow: auto; min-height: 0; }
+
+  /* Editor textarea */
+  #editor {
+    width: 100%; height: 100%; border: 0; resize: none; outline: none;
+    padding: 16px 18px; font-family: var(--mono); font-size: 13.5px; line-height: 1.6;
+    color: var(--ink); background: var(--surface-2); tab-size: 2;
+  }
+  #editor.dragover { background: var(--accent-bg); box-shadow: inset 0 0 0 2px var(--accent); }
+
+  /* Preview content styling (approximates a clean article reading view) */
+  #preview { padding: 22px 26px; }
+  #preview .nl-shell { /* newsletter table inherits its own inline styles */ }
+  .article :where(h1,h2,h3,h4) { line-height: 1.25; margin: 1.4em 0 .5em; font-weight: 700; }
+  .article h1 { font-size: 1.9em; }
+  .article h2 { font-size: 1.5em; }
+  .article h3 { font-size: 1.22em; }
+  .article h4 { font-size: 1.05em; }
+  .article p { margin: 0 0 1em; }
+  .article a { color: var(--accent-ink); text-decoration: underline; }
+  .article strong { font-weight: 700; }
+  .article em { font-style: italic; }
+  .article del { color: var(--muted); }
+  .article ul, .article ol { margin: 0 0 1em; padding-left: 1.5em; }
+  .article li { margin: .25em 0; }
+  .article li > ul, .article li > ol { margin: .25em 0; }
+  .article blockquote {
+    margin: 1em 0; padding: .4em 1.1em; border-left: 3px solid var(--accent);
+    color: var(--muted); background: var(--surface-2);
+  }
+  .article code { font-family: var(--mono); font-size: .9em; background: var(--code-bg); padding: .12em .4em; border-radius: 4px; }
+  .article pre { background: #1c1b19; color: #f4f3ee; padding: 14px 16px; border-radius: var(--radius); overflow: auto; margin: 0 0 1em; }
+  .article pre code { background: transparent; padding: 0; color: inherit; font-size: 12.5px; }
+  .article hr { border: 0; border-top: 1px solid var(--line-2); margin: 1.6em 0; }
+  .article img { max-width: 100%; height: auto; border-radius: 4px; }
+  .article figure { margin: 1.2em 0; position: relative; }
+  .article figcaption { font-size: .85em; color: var(--muted); font-style: italic; margin-top: .4em; }
+
+  /* Per-diagram controls in the preview (Download PNG / Copy image).        */
+  /* These live only in the live preview DOM — never in the copied output.   */
+  #previewInner figure { position: relative; }
+  .diagram-tools {
+    position: absolute; top: 8px; right: 8px; display: flex; gap: 6px;
+    opacity: 0; transition: opacity .15s; z-index: 2;
+  }
+  #previewInner figure:hover .diagram-tools,
+  #previewInner figure:focus-within .diagram-tools { opacity: 1; }
+  .diagram-tools .btn { padding: 4px 9px; font-size: 11px; background: rgba(255,255,255,.96); box-shadow: var(--shadow); }
+
+  /* HTML output */
+  #htmlout {
+    width: 100%; height: 100%; border: 0; resize: none; outline: none;
+    padding: 16px 18px; font-family: var(--mono); font-size: 12px; line-height: 1.55;
+    color: var(--ink); background: var(--surface-2); white-space: pre; tab-size: 2;
+  }
+
+  /* ----------------------------- Image panel ---------------------------- */
+  .img-panel { border-top: 1px solid var(--line); background: var(--surface); max-height: 42%; display: flex; flex-direction: column; }
+  .img-panel .pane-head { cursor: default; }
+  .img-panel.collapsed .img-list, .img-panel.collapsed .img-empty { display: none; }
+  .img-list { overflow: auto; padding: 8px 10px; display: flex; flex-direction: column; gap: 8px; }
+  .img-empty { padding: 14px; color: var(--muted); font-size: 12.5px; text-align: center; }
+  .img-card {
+    display: grid; grid-template-columns: 56px 1fr; gap: 10px;
+    border: 1px solid var(--line); border-radius: var(--radius); padding: 8px; background: var(--surface-2);
+  }
+  .img-card img { width: 56px; height: 56px; object-fit: cover; border-radius: 4px; background: var(--code-bg); }
+  .img-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 8px; align-items: center; }
+  .img-fields label { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+  .img-fields .full { grid-column: 1 / -1; }
+  .img-fields input, .img-fields select {
+    width: 100%; font: inherit; font-size: 12px; padding: 4px 6px;
+    border: 1px solid var(--line-2); border-radius: 5px; background: #fff; color: var(--ink);
+  }
+  .img-fields .ref { font-family: var(--mono); font-size: 11px; color: var(--accent-ink); }
+  .img-card .row { display: flex; gap: 6px; align-items: center; }
+
+  /* ------------------------------- Notes -------------------------------- */
+  details.notes { border-top: 1px solid var(--line); background: var(--surface); }
+  details.notes > summary {
+    list-style: none; cursor: pointer; padding: 10px 18px; font-size: 13px;
+    font-weight: 600; color: var(--accent-ink); display: flex; align-items: center; gap: 8px;
+  }
+  details.notes > summary::-webkit-details-marker { display: none; }
+  details.notes > summary::before { content: "▸"; color: var(--muted); }
+  details.notes[open] > summary::before { content: "▾"; }
+  .notes-body { padding: 4px 22px 22px; columns: 2; column-gap: 40px; font-size: 13.5px; color: var(--ink); }
+  .notes-body h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 14px 0 6px; break-after: avoid; }
+  .notes-body ol, .notes-body ul { margin: 0 0 8px; padding-left: 1.3em; }
+  .notes-body li { margin: 3px 0; break-inside: avoid; }
+  .notes-body code { font-family: var(--mono); background: var(--code-bg); padding: .1em .35em; border-radius: 4px; font-size: 12px; }
+  @media (max-width: 760px) { .notes-body { columns: 1; } }
+
+  /* ------------------------------- Toast -------------------------------- */
+  #toast {
+    position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%) translateY(20px);
+    background: var(--ink); color: #fff; padding: 10px 18px; border-radius: 999px;
+    font-size: 13px; box-shadow: var(--shadow); opacity: 0; pointer-events: none;
+    transition: opacity .2s, transform .2s; z-index: 100;
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  #toast.err { background: var(--danger); }
+
+  /* ----------------------- Mobile: tab the 3 panes ---------------------- */
+  .tabs { display: none; gap: 6px; padding: 8px 14px; background: var(--surface); border-bottom: 1px solid var(--line); }
+  .tabs button { flex: 1; }
+  @media (max-width: 980px) {
+    main { grid-template-columns: 1fr; height: auto; }
+    .tabs { display: flex; position: sticky; top: 57px; z-index: 20; }
+    .pane { height: 62vh; }
+    .pane[hidden] { display: none; }
+    .img-panel { max-height: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ============================== TOOLBAR ============================== -->
+<header>
+  <div class="brand">
+    <span class="mark">md <span class="arrow">→</span> html</span>
+    <span class="sub">rich HTML for LinkedIn Articles &amp; newsletters</span>
+  </div>
+
+  <!-- Output mode: changes how the HTML is serialized -->
+  <div class="modes" role="group" aria-label="Output mode">
+    <button id="modeLinkedIn" aria-pressed="true">LinkedIn Article</button>
+    <button id="modeNewsletter" aria-pressed="false">Newsletter</button>
+  </div>
+
+  <div class="toolbar-group">
+    <button class="btn primary" id="copyRich" title="Copy formatted content — paste into the LinkedIn Article editor or an email">Copy rendered</button>
+    <button class="btn" id="copyHtml" title="Copy raw HTML source — paste into a newsletter / email tool's HTML view">Copy raw HTML</button>
+    <button class="btn" id="addImage" title="Add a local image (also: paste or drag-drop into the editor)">Add image</button>
+    <button class="btn ghost" id="clearAll" title="Clear the editor and stored images">Clear</button>
+  </div>
+</header>
+
+<!-- Mobile-only tab switcher (hidden on wide screens where all 3 panes show) -->
+<nav class="tabs" id="tabs" aria-label="Panes">
+  <button class="btn" data-tab="0" aria-pressed="true">Editor</button>
+  <button class="btn" data-tab="1" aria-pressed="false">Preview</button>
+  <button class="btn" data-tab="2" aria-pressed="false">HTML</button>
+</nav>
+
+<!-- =============================== PANES =============================== -->
+<main>
+  <!-- 1. EDITOR -------------------------------------------------------- -->
+  <section class="pane" data-pane="0">
+    <div class="pane-head">
+      <h2>Markdown</h2>
+      <div class="right"><span style="font-size:11px;color:var(--muted)">paste / drop images here</span></div>
+    </div>
+    <div class="pane-body" style="display:flex;flex-direction:column;padding:0;">
+      <textarea id="editor" spellcheck="true" placeholder="# Start typing Markdown…"></textarea>
+    </div>
+
+    <!-- Image manager: controls width / alignment / caption / alt for local images -->
+    <div class="img-panel collapsed" id="imgPanel">
+      <div class="pane-head">
+        <h2>Images <span id="imgCount" style="color:var(--accent-ink)"></span></h2>
+        <div class="right">
+          <button class="btn ghost" id="toggleImgPanel" style="padding:4px 8px;">show</button>
+        </div>
+      </div>
+      <div class="img-empty" id="imgEmpty">No local images yet. Paste, drag-drop, or use “Add image”.</div>
+      <div class="img-list" id="imgList"></div>
+    </div>
+  </section>
+
+  <!-- 2. LIVE PREVIEW -------------------------------------------------- -->
+  <section class="pane" data-pane="1" hidden>
+    <div class="pane-head">
+      <h2>Live preview</h2>
+      <div class="right"><span id="modeLabel" style="font-size:11px;color:var(--muted)">LinkedIn Article</span></div>
+    </div>
+    <div class="pane-body" id="preview"><div class="article" id="previewInner"></div></div>
+  </section>
+
+  <!-- 3. RENDERED HTML OUTPUT ------------------------------------------ -->
+  <section class="pane" data-pane="2" hidden>
+    <div class="pane-head">
+      <h2>HTML output</h2>
+      <div class="right"><span style="font-size:11px;color:var(--muted)">read-only · current mode</span></div>
+    </div>
+    <div class="pane-body" style="padding:0;">
+      <textarea id="htmlout" readonly spellcheck="false"></textarea>
+    </div>
+  </section>
+</main>
+
+<!-- =============================== NOTES =============================== -->
+<details class="notes">
+  <summary>How to use this</summary>
+  <div class="notes-body">
+    <h3>1 · Write Markdown</h3>
+    <ul>
+      <li>Headings <code>#</code>–<code>####</code>, <code>**bold**</code>, <code>*italic*</code>, <code>~~strike~~</code>.</li>
+      <li>Lists with <code>-</code>/<code>1.</code>; indent two spaces to nest.</li>
+      <li><code>&gt;</code> blockquotes, <code>---</code> rules, <code>`inline code`</code>, fenced <code>```</code> blocks, <code>[links](url)</code>.</li>
+      <li>Wrapped lines flow into one paragraph; end a line with two spaces (or <code>\</code>) to force a line break.</li>
+    </ul>
+
+    <h3>2 · Preview the result</h3>
+    <ul>
+      <li>The middle pane renders live as you type.</li>
+      <li>Switch <strong>LinkedIn Article</strong> / <strong>Newsletter</strong> in the top bar — the preview and HTML both follow the mode.</li>
+    </ul>
+
+    <h3>3 · Images</h3>
+    <ul>
+      <li>Markdown images <code>![alt](https://…)</code> render directly. Add options: <code>![alt](url){width=400 align=center caption="My caption"}</code>.</li>
+      <li>For <strong>local</strong> images: paste, drag-drop, or “Add image”. They’re embedded as base64 data URLs and listed in the <strong>Images</strong> panel where you set width, alignment, caption and alt.</li>
+      <li>Local images are referenced as <code>![alt](img:ID)</code> in the editor — the panel controls the rest, so the editor stays readable.</li>
+    </ul>
+
+    <h3>4 · Mermaid diagrams</h3>
+    <ul>
+      <li>Use a fenced <code>```mermaid</code> block (flowcharts, sequence, etc.). It renders to an image automatically.</li>
+      <li>The library loads on demand: a local <code>mermaid.min.js</code> next to this file (best for offline), else a CDN. Without either, the block stays as code.</li>
+      <li>LinkedIn and email strip SVG, so diagrams become <strong>PNG</strong>. Hover a diagram in the preview for <strong>Download PNG</strong> / <strong>Copy image</strong>.</li>
+      <li>For LinkedIn, the reliable route is <strong>Download PNG</strong> then upload via the Article editor’s image button — paste of a diagram is hit-and-miss.</li>
+    </ul>
+
+    <h3>5 · Paste into a LinkedIn Article</h3>
+    <ol>
+      <li>Pick <strong>LinkedIn Article</strong> mode.</li>
+      <li>Click <strong>Copy rendered</strong>.</li>
+      <li>In LinkedIn’s Article editor, click into the body and paste (Ctrl/Cmd-V).</li>
+      <li>LinkedIn keeps headings, bold/italic, lists, quotes, links and images, but strips most styling — that’s expected, and why this mode outputs clean semantic tags.</li>
+    </ol>
+
+    <h3>6 · Copy raw HTML for newsletters</h3>
+    <ol>
+      <li>Pick <strong>Newsletter</strong> mode (inline styles, 600px email shell, mobile-friendly).</li>
+      <li>Click <strong>Copy raw HTML</strong> and paste into your email tool’s HTML / code view.</li>
+      <li>Or <strong>Copy rendered</strong> to paste formatted content into a WYSIWYG email composer.</li>
+    </ol>
+
+    <h3>Gotchas</h3>
+    <ul>
+      <li>Base64 images bloat the HTML. Fine for LinkedIn paste; for newsletters, host images and use real URLs where you can — some email tools reject data URLs.</li>
+      <li>Outlook desktop ignores <code>max-width</code>; Newsletter mode uses a fixed 600px table to cope.</li>
+      <li>Mermaid diagrams export as PNG data URLs — fine for LinkedIn upload, but heavy for email. For newsletters, download the PNG and host it, or use the Download/Copy buttons.</li>
+      <li><strong>Copy rendered</strong> needs a clipboard-permitting context. Opening the file directly works in most browsers; if a copy ever fails, the tool falls back automatically.</li>
+    </ul>
+  </div>
+</details>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+/* ==========================================================================
+   STATE
+   ========================================================================== */
+let MODE = "linkedin";                 // "linkedin" | "newsletter"
+const images = new Map();              // id -> {dataUrl, alt, width, align, caption}
+let imgSeq = 0;
+
+/* short, editor-friendly ids like i1, i2 … */
+function nextImageId() { return "i" + (++imgSeq); }
+
+/* ==========================================================================
+   MARKDOWN PARSER  (Markdown text -> neutral semantic HTML string)
+   --------------------------------------------------------------------------
+   Block-level first (headings, code fences, lists, quotes, rules, images,
+   paragraphs), then inline (code, images, links, bold, italic, strike).
+   Output uses semantic tags + data-* on figures so each mode can serialize.
+   ========================================================================== */
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/* Only http(s), mailto, anchors and image data URLs are allowed through. */
+function safeUrl(url) {
+  const u = String(url).trim();
+  if (/^(https?:|mailto:|#|\/|\.\/|\.\.\/)/i.test(u)) return u;
+  if (/^data:image\//i.test(u)) return u;
+  return ""; // anything else (javascript:, vbscript:, …) is dropped
+}
+
+/* Mermaid source is stashed in a figure's data-mermaid attribute as base64
+   (unicode-safe) so newlines/quotes can't break the markup. */
+function encMermaid(s) { return btoa(unescape(encodeURIComponent(s))); }
+function decMermaid(s) { try { return decodeURIComponent(escape(atob(s))); } catch (e) { return ""; } }
+
+/* ---- inline parsing -------------------------------------------------- */
+/* Strategy: pull out code spans, images and links into placeholders FIRST
+   (so their raw URLs/titles/captions survive), THEN escape the remaining
+   prose, THEN apply emphasis, THEN restore the placeholders. */
+function emphasize(s) {
+  s = s.replace(/\*\*([^*]+?)\*\*/g, "<strong>$1</strong>");
+  // Underscore strong/em guarded by non-word boundaries (avoids snake_case).
+  s = s.replace(/(^|[^\w])__([^_]+?)__(?=[^\w]|$)/g, "$1<strong>$2</strong>");
+  s = s.replace(/\*([^*]+?)\*/g, "<em>$1</em>");
+  s = s.replace(/(^|[^\w])_([^_]+?)_(?=[^\w]|$)/g, "$1<em>$2</em>");
+  s = s.replace(/~~([^~]+?)~~/g, "<del>$1</del>");
+  return s;
+}
+
+function parseInline(text) {
+  const store = [];
+  const tok = () => "\u0000" + (store.length - 1) + "\u0000";
+  let s = String(text);
+
+  // 1. Inline code — contents escaped, never re-formatted.
+  s = s.replace(/`([^`]+)`/g, (_, c) => {
+    store.push("<code>" + escapeHtml(c) + "</code>");
+    return tok();
+  });
+
+  // 2. Images (before links — the leading "!" disambiguates).
+  s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)(\{[^}]*\})?/g,
+    (_, alt, url, title, attrs) => { store.push(buildImage(alt, url, attrs)); return tok(); });
+
+  // 3. Links (link text may itself contain emphasis).
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (_, txt, url, title) => {
+    const href = safeUrl(url);
+    if (!href) return txt; // not a usable link: leave text, escaped later
+    const t = title ? ' title="' + escapeHtml(title) + '"' : "";
+    const ext = /^https?:/i.test(href) ? ' target="_blank" rel="noopener noreferrer"' : "";
+    store.push('<a href="' + escapeHtml(href) + '"' + t + ext + ">" +
+               emphasize(escapeHtml(txt)) + "</a>");
+    return tok();
+  });
+
+  // 4. Escape remaining prose, 5. emphasis, 6. restore placeholders.
+  s = emphasize(escapeHtml(s));
+  s = s.replace(/\u0000(\d+)\u0000/g, (_, i) => store[+i]);
+  return s;
+}
+
+/* ---- image element builder ------------------------------------------ */
+/* Handles both stored local images (img:ID) and external Markdown images. */
+function parseImgAttrs(attrs) {
+  const out = {};
+  if (!attrs) return out;
+  const body = attrs.slice(1, -1); // strip { }
+  let m;
+  const re = /(\w+)\s*=\s*("([^"]*)"|'([^']*)'|[^\s}]+)/g;
+  while ((m = re.exec(body))) {
+    const key = m[1].toLowerCase();
+    const val = m[3] ?? m[4] ?? m[2];
+    out[key] = val;
+  }
+  return out;
+}
+
+function buildImage(alt, url, attrs) {
+  // Resolve a stored local image reference.
+  let data = { alt: alt || "", width: "", align: "", caption: "", src: "" };
+  const ref = /^img:(.+)$/.exec(url.trim());
+  if (ref && images.has(ref[1])) {
+    const meta = images.get(ref[1]);
+    data.src = meta.dataUrl;
+    data.alt = (alt && alt.length) ? alt : (meta.alt || "");
+    data.width = meta.width || "";
+    data.align = meta.align || "";
+    data.caption = meta.caption || "";
+  } else if (ref) {
+    // Reference to a deleted/missing image.
+    return '<span data-missing-img="1" style="color:#a23b2d">[missing image: ' +
+           escapeHtml(ref[1]) + "]</span>";
+  } else {
+    const safe = safeUrl(url);
+    if (!safe) return escapeHtml(alt || "");
+    data.src = safe;
+    const a = parseImgAttrs(attrs);
+    if (a.width) data.width = a.width;
+    if (a.align) data.align = a.align;
+    if (a.caption) data.caption = a.caption;
+  }
+  return figureHtml(data);
+}
+
+/* Neutral figure markup. Mode serializers read data-* to apply styling. */
+function figureHtml(d) {
+  const alt = escapeHtml(d.alt || "");
+  const width = d.width ? ' data-width="' + escapeHtml(d.width) + '"' : "";
+  const align = d.align ? ' data-align="' + escapeHtml(d.align) + '"' : "";
+  const img = '<img src="' + escapeHtml(d.src) + '" alt="' + alt + '"' + width + align + ">";
+  if (d.caption) {
+    return "<figure" + align + ">" + img +
+           "<figcaption>" + parseInline(d.caption) + "</figcaption></figure>";
+  }
+  return "<figure" + align + ">" + img + "</figure>";
+}
+
+/* ---- list parsing (supports nesting via indentation) ----------------- */
+function parseListBlock(lines) {
+  // 1) Turn lines into items; non-marker indented lines continue the previous.
+  const items = [];
+  for (const line of lines) {
+    const m = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/.exec(line);
+    if (m) {
+      items.push({
+        indent: m[1].replace(/\t/g, "  ").length,
+        ordered: /\d/.test(m[2]),
+        text: m[3]
+      });
+    } else if (items.length) {
+      items[items.length - 1].text += "\n" + line.trim();
+    }
+  }
+  // 2) Build a tree using an indent stack.
+  const root = { children: [], indent: -1 };
+  const stack = [root];
+  for (const it of items) {
+    const node = { ordered: it.ordered, text: it.text, children: [], indent: it.indent };
+    while (stack.length > 1 && stack[stack.length - 1].indent >= node.indent) stack.pop();
+    stack[stack.length - 1].children.push(node);
+    stack.push(node);
+  }
+  return renderListNodes(root.children);
+}
+
+function renderListNodes(nodes) {
+  let html = "";
+  let i = 0;
+  while (i < nodes.length) {
+    const ordered = nodes[i].ordered;
+    const group = [];
+    while (i < nodes.length && nodes[i].ordered === ordered) group.push(nodes[i++]);
+    const tag = ordered ? "ol" : "ul";
+    html += "<" + tag + ">";
+    for (const n of group) {
+      html += "<li>" + parseInline(n.text.replace(/\n/g, " ")) +
+              (n.children.length ? renderListNodes(n.children) : "") + "</li>";
+    }
+    html += "</" + tag + ">";
+  }
+  return html;
+}
+
+/* ---- main block tokenizer -------------------------------------------- */
+const RE_HEADING = /^(#{1,4})\s+(.*)$/;
+const RE_HR      = /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/;
+const RE_LIST    = /^(\s*)([-*+]|\d+[.)])\s+/;
+const RE_QUOTE   = /^ {0,3}>\s?/;
+const RE_FENCE   = /^ {0,3}(`{3,}|~{3,})\s*([\w+-]*)\s*$/;
+const RE_IMGLINE = /^!\[[^\]]*\]\([^)]+\)(\{[^}]*\})?\s*$/;
+
+function mdToHtml(src) {
+  const lines = src.replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Blank line -> skip.
+    if (/^\s*$/.test(line)) { i++; continue; }
+
+    // Fenced code block.
+    let fm = RE_FENCE.exec(line);
+    if (fm) {
+      const fence = fm[1][0];
+      const lang = fm[2];
+      const buf = [];
+      i++;
+      while (i < lines.length && !new RegExp("^ {0,3}" + fence + "{3,}\\s*$").test(lines[i])) {
+        buf.push(lines[i]); i++;
+      }
+      i++; // consume closing fence
+      // A ```mermaid block becomes a neutral marker; it's rendered to a PNG
+      // asynchronously (see the Mermaid section) and resolved at serialize time.
+      if (/^mermaid$/i.test(lang)) {
+        out.push('<figure data-mermaid="' + encMermaid(buf.join("\n")) + '"></figure>');
+        continue;
+      }
+      const cls = lang ? ' class="language-' + escapeHtml(lang) + '"' : "";
+      out.push("<pre><code" + cls + ">" + escapeHtml(buf.join("\n")) + "</code></pre>");
+      continue;
+    }
+
+    // Horizontal rule.
+    if (RE_HR.test(line)) { out.push("<hr>"); i++; continue; }
+
+    // Heading.
+    let hm = RE_HEADING.exec(line);
+    if (hm) {
+      const level = hm[1].length;
+      out.push("<h" + level + ">" + parseInline(hm[2].trim()) + "</h" + level + ">");
+      i++; continue;
+    }
+
+    // Blockquote (gather, strip one ">" level, recurse).
+    if (RE_QUOTE.test(line)) {
+      const buf = [];
+      while (i < lines.length && RE_QUOTE.test(lines[i])) {
+        buf.push(lines[i].replace(RE_QUOTE, "")); i++;
+      }
+      out.push("<blockquote>" + mdToHtml(buf.join("\n")) + "</blockquote>");
+      continue;
+    }
+
+    // List (gather list items + indented continuations until a blank line).
+    if (RE_LIST.test(line)) {
+      const buf = [];
+      while (i < lines.length && lines[i].trim() !== "" &&
+             (RE_LIST.test(lines[i]) || /^\s+\S/.test(lines[i]))) {
+        buf.push(lines[i]); i++;
+      }
+      out.push(parseListBlock(buf));
+      continue;
+    }
+
+    // Standalone image line -> block-level figure.
+    if (RE_IMGLINE.test(line.trim())) {
+      out.push(parseInline(line.trim()));
+      i++; continue;
+    }
+
+    // Paragraph: gather until a blank line or the start of another block.
+    const buf = [line];
+    i++;
+    while (i < lines.length && lines[i].trim() !== "" &&
+           !RE_HEADING.test(lines[i]) && !RE_HR.test(lines[i]) &&
+           !RE_QUOTE.test(lines[i]) && !RE_LIST.test(lines[i]) &&
+           !RE_FENCE.test(lines[i]) && !RE_IMGLINE.test(lines[i].trim())) {
+      buf.push(lines[i]); i++;
+    }
+    // Line-break handling (standard Markdown): a plain wrapped line joins with
+    // a space; an explicit hard break (two trailing spaces or a trailing "\")
+    // becomes <br>. This avoids mangling normally word-wrapped prose.
+    let html = "";
+    for (let k = 0; k < buf.length; k++) {
+      const raw = buf[k];
+      const hard = / {2,}$/.test(raw) || /\\\s*$/.test(raw);
+      html += parseInline(raw.trim().replace(/\\+\s*$/, ""));
+      if (k < buf.length - 1) html += hard ? "<br>\n" : " ";
+    }
+    out.push("<p>" + html + "</p>");
+  }
+  return out.join("\n");
+}
+
+/* ==========================================================================
+   SANITIZE  (allow-list of tags + attributes; kills scripts/handlers)
+   ========================================================================== */
+const ALLOWED_TAGS = new Set(["h1","h2","h3","h4","p","strong","em","b","i","del","s",
+  "ul","ol","li","blockquote","a","img","pre","code","hr","br","figure","figcaption","span"]);
+const ALLOWED_ATTRS = {
+  a: ["href","title","target","rel"],
+  img: ["src","alt","data-width","data-align"],
+  figure: ["data-align","data-mermaid"],
+  code: ["class"],
+  span: ["data-missing-img","style"]
+};
+
+function sanitize(html) {
+  const doc = new DOMParser().parseFromString("<div>" + html + "</div>", "text/html");
+  const root = doc.body.firstChild;
+
+  (function walk(node) {
+    const kids = Array.from(node.childNodes);
+    for (const child of kids) {
+      if (child.nodeType === 1) { // element
+        const tag = child.tagName.toLowerCase();
+        if (!ALLOWED_TAGS.has(tag)) {
+          // Unwrap unknown tags (keep their text), drop dangerous containers.
+          if (tag === "script" || tag === "style" || tag === "iframe" || tag === "object") {
+            child.remove();
+          } else {
+            while (child.firstChild) node.insertBefore(child.firstChild, child);
+            child.remove();
+          }
+          continue;
+        }
+        // Scrub attributes against the allow-list.
+        const allow = ALLOWED_ATTRS[tag] || [];
+        for (const attr of Array.from(child.attributes)) {
+          const name = attr.name.toLowerCase();
+          if (name.startsWith("on") || !allow.includes(name)) { child.removeAttribute(attr.name); continue; }
+          if ((name === "href" || name === "src") && !safeUrl(attr.value)) child.removeAttribute(attr.name);
+        }
+        walk(child);
+      }
+      // text/comment nodes: keep text, comments are harmless but we drop them.
+      else if (child.nodeType === 8) child.remove();
+    }
+  })(root);
+
+  return root.innerHTML;
+}
+
+/* ==========================================================================
+   MERMAID  (lazy-loaded; renders ```mermaid blocks to PNG for paste/email)
+   --------------------------------------------------------------------------
+   Pipeline per diagram:  source -> mermaid.render() -> SVG -> <canvas> -> PNG
+   PNG (not SVG) because LinkedIn Articles and email clients strip inline SVG.
+   Results are cached by source string so typing stays cheap.
+   ========================================================================== */
+const mermaidCache = new Map();   // source -> { png } | { error }
+const mermaidPending = new Set(); // sources currently rendering
+let mermaidLib = null;            // null=untried, false=unavailable, true=ready
+let mmdSeq = 0;
+
+/* Load mermaid only when first needed: local file first, then CDN fallback. */
+function loadMermaid() {
+  return new Promise(resolve => {
+    if (window.mermaid) return resolve(true);
+    const sources = [
+      "mermaid.min.js", // drop this next to index.html for full offline support
+      "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"
+    ];
+    let idx = 0;
+    (function tryNext() {
+      if (idx >= sources.length) return resolve(false);
+      const s = document.createElement("script");
+      s.src = sources[idx++];
+      s.onload = () => window.mermaid ? resolve(true) : tryNext();
+      s.onerror = tryNext;
+      document.head.appendChild(s);
+    })();
+  });
+}
+
+/* Give the SVG explicit pixel dimensions (mermaid uses %/viewBox) so it
+   rasterises at the right size, and strip max-width styling. */
+function normalizeSvg(svg) {
+  const el = new DOMParser().parseFromString(svg, "image/svg+xml").documentElement;
+  const vb = (el.getAttribute("viewBox") || "").split(/[\s,]+/).map(Number);
+  let w = vb.length === 4 ? vb[2] : parseFloat(el.getAttribute("width")) || 800;
+  let h = vb.length === 4 ? vb[3] : parseFloat(el.getAttribute("height")) || 600;
+  el.setAttribute("width", w);
+  el.setAttribute("height", h);
+  el.removeAttribute("style");
+  return { svg: new XMLSerializer().serializeToString(el), w, h };
+}
+
+/* SVG string -> PNG data URL via an offscreen canvas (2x for crispness). */
+function svgToPng(svgString, scale) {
+  return new Promise((resolve, reject) => {
+    const norm = normalizeSvg(svgString);
+    const blob = new Blob([norm.svg], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(norm.w * scale));
+      canvas.height = Math.max(1, Math.round(norm.h * scale));
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
+      ctx.fillStyle = "#ffffff"; // white backing — LinkedIn/email don't do transparency well
+      ctx.fillRect(0, 0, norm.w, norm.h);
+      ctx.drawImage(img, 0, 0);
+      URL.revokeObjectURL(url);
+      try { resolve(canvas.toDataURL("image/png")); }
+      catch (e) { reject(e); } // would only happen if the canvas were tainted
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("SVG failed to load")); };
+    img.src = url;
+  });
+}
+
+/* Render one diagram (cached). */
+async function renderMermaid(source) {
+  if (mermaidCache.has(source)) return mermaidCache.get(source);
+  try {
+    const { svg } = await window.mermaid.render("mmd" + (++mmdSeq), source);
+    const png = await svgToPng(svg, 2);
+    const entry = { png };
+    mermaidCache.set(source, entry);
+    return entry;
+  } catch (e) {
+    const entry = { error: (e && e.message) ? e.message : String(e) };
+    mermaidCache.set(source, entry);
+    return entry;
+  }
+}
+
+/* Kick off rendering for any diagram sources not yet cached, then re-render
+   the panes as each one resolves. Guarded so the lib loads at most once. */
+async function kickMermaid(sources) {
+  if (!sources.length) return;
+  if (mermaidLib === null) {
+    mermaidLib = await loadMermaid();
+    if (mermaidLib) {
+      window.mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: "strict",
+        theme: "default",
+        flowchart: { htmlLabels: false }, // SVG text, not foreignObject -> PNG export works
+        sequence: { useMaxWidth: true }
+      });
+    }
+  }
+  let changed = false;
+  for (const src of sources) {
+    if (mermaidCache.has(src) || mermaidPending.has(src)) continue;
+    if (!mermaidLib) {
+      mermaidCache.set(src, { error: "Mermaid library not loaded (offline). Place mermaid.min.js next to this file." });
+      changed = true;
+      continue;
+    }
+    mermaidPending.add(src);
+    renderMermaid(src).then(() => { mermaidPending.delete(src); scheduleRender(); });
+  }
+  if (changed) scheduleRender();
+}
+
+/* Replace each mermaid marker in a (cloned) DOM with its rendered form,
+   BEFORE the generic figure/image styling pass runs. */
+function expandMermaid(root) {
+  root.querySelectorAll("figure[data-mermaid]").forEach(fig => {
+    const source = decMermaid(fig.getAttribute("data-mermaid"));
+    const entry = mermaidCache.get(source);
+    let repl;
+    if (entry && entry.png) {
+      // Centered figure with the rasterised diagram — flows through both modes.
+      repl = document.createElement("figure");
+      repl.setAttribute("data-align", "center");
+      const img = document.createElement("img");
+      img.setAttribute("src", entry.png);
+      img.setAttribute("alt", "Diagram");
+      img.setAttribute("data-align", "center");
+      repl.appendChild(img);
+    } else if (entry && entry.error) {
+      // Render failed (or offline): keep the source as a code block so nothing is lost.
+      repl = document.createElement("pre");
+      const code = document.createElement("code");
+      code.className = "language-mermaid";
+      code.textContent = source;
+      repl.appendChild(code);
+    } else {
+      repl = document.createElement("p");
+      repl.textContent = "Rendering diagram…";
+    }
+    fig.replaceWith(repl);
+  });
+}
+
+/* ==========================================================================
+   SERIALIZERS  (neutral DOM -> mode-specific HTML)
+   ========================================================================== */
+
+/* Parse helper: neutral, sanitized DOM from current editor text. */
+function neutralDoc(md) {
+  const clean = sanitize(mdToHtml(md));
+  return new DOMParser().parseFromString("<div id='r'>" + clean + "</div>", "text/html")
+                        .querySelector("#r");
+}
+
+/* ---- LinkedIn Article: clean semantic tags, minimal inline styling ---- */
+function serializeLinkedIn(root) {
+  const r = root.cloneNode(true);
+  expandMermaid(r); // resolve ```mermaid markers to image figures (or code/placeholder)
+  r.querySelectorAll("figure").forEach(fig => {
+    const align = fig.getAttribute("data-align");
+    fig.removeAttribute("data-align");
+    if (align && align !== "left") fig.setAttribute("style", "text-align:" + align + ";");
+    const img = fig.querySelector("img");
+    if (img) applyImgSize(img, align, false);
+  });
+  // Standalone <img> (rare) handled too.
+  r.querySelectorAll("img").forEach(img => applyImgSize(img, img.getAttribute("data-align"), false));
+  return prettyHtml(r);
+}
+
+/* Convert data-width/data-align into LinkedIn-safe img width attr + style. */
+function applyImgSize(img, align, inline) {
+  const w = img.getAttribute("data-width");
+  img.removeAttribute("data-width");
+  img.removeAttribute("data-align");
+  const styles = [];
+  if (w) {
+    if (/%$/.test(w)) { styles.push("width:" + w); }
+    else { img.setAttribute("width", w.replace(/px$/, "")); styles.push("max-width:100%"); }
+  } else {
+    styles.push("max-width:100%");
+  }
+  styles.push("height:auto");
+  if (align === "center") styles.push("display:block", "margin-left:auto", "margin-right:auto");
+  img.setAttribute("style", styles.join(";") + ";");
+}
+
+/* ---- Newsletter: inline styles + 600px email-safe table shell -------- */
+const NL = {
+  body:  "margin:0;padding:0;background:#f4f3ee;",
+  td:    "padding:28px 32px;font-family:Helvetica,Arial,sans-serif;color:#1c1b19;font-size:16px;line-height:1.6;",
+  h1:    "font-family:Helvetica,Arial,sans-serif;font-size:28px;line-height:1.25;font-weight:700;color:#1c1b19;margin:24px 0 12px;",
+  h2:    "font-family:Helvetica,Arial,sans-serif;font-size:22px;line-height:1.3;font-weight:700;color:#1c1b19;margin:22px 0 10px;",
+  h3:    "font-family:Helvetica,Arial,sans-serif;font-size:18px;line-height:1.35;font-weight:700;color:#1c1b19;margin:18px 0 8px;",
+  h4:    "font-family:Helvetica,Arial,sans-serif;font-size:16px;line-height:1.4;font-weight:700;color:#1c1b19;margin:16px 0 8px;",
+  p:     "margin:0 0 16px;font-size:16px;line-height:1.6;color:#1c1b19;",
+  a:     "color:#0a4e43;text-decoration:underline;",
+  ul:    "margin:0 0 16px;padding-left:22px;",
+  ol:    "margin:0 0 16px;padding-left:22px;",
+  li:    "margin:6px 0;font-size:16px;line-height:1.5;color:#1c1b19;",
+  blockquote: "margin:16px 0;padding:8px 18px;border-left:4px solid #0e6b5c;background:#faf9f5;color:#6b6a64;font-style:italic;",
+  pre:   "margin:0 0 16px;padding:16px;background:#1c1b19;color:#f4f3ee;border-radius:8px;overflow:auto;font-family:Consolas,Menlo,monospace;font-size:13px;line-height:1.5;",
+  code:  "font-family:Consolas,Menlo,monospace;font-size:14px;background:#f1efe9;padding:2px 6px;border-radius:4px;",
+  hr:    "border:0;border-top:1px solid #cfccc2;margin:24px 0;",
+  figure: "margin:20px 0;",
+  figcaption: "font-size:13px;color:#6b6a64;font-style:italic;margin-top:8px;",
+  img:   "max-width:100%;height:auto;display:block;border:0;"
+};
+
+function serializeNewsletter(root) {
+  const r = root.cloneNode(true);
+  expandMermaid(r); // resolve ```mermaid markers before inlining styles
+
+  // Apply inline styles tag by tag.
+  r.querySelectorAll("*").forEach(el => {
+    const tag = el.tagName.toLowerCase();
+    if (tag === "code" && el.parentElement && el.parentElement.tagName.toLowerCase() === "pre") return; // pre handles it
+    if (NL[tag]) el.setAttribute("style", NL[tag]);
+  });
+
+  // Figures: alignment + image sizing.
+  r.querySelectorAll("figure").forEach(fig => {
+    const align = fig.getAttribute("data-align") || "left";
+    fig.removeAttribute("data-align");
+    fig.setAttribute("style", NL.figure + "text-align:" + align + ";");
+    const cap = fig.querySelector("figcaption");
+    if (cap) cap.setAttribute("style", NL.figcaption + "text-align:" + align + ";");
+    const img = fig.querySelector("img");
+    if (img) styleNlImg(img, align);
+  });
+  r.querySelectorAll("img:not(figure img)").forEach(img => styleNlImg(img, img.getAttribute("data-align")));
+
+  const inner = prettyHtml(r);
+
+  // Email-safe shell: full-width table -> centered fixed 600px table.
+  // Fixed width (not just max-width) so Outlook desktop behaves.
+  return [
+    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="' + NL.body + '">',
+    '  <tr>',
+    '    <td align="center" style="padding:16px;">',
+    '      <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:600px;background:#ffffff;border-radius:10px;">',
+    '        <tr>',
+    '          <td style="' + NL.td + '">',
+    indent(inner, 12),
+    '          </td>',
+    '        </tr>',
+    '      </table>',
+    '    </td>',
+    '  </tr>',
+    '</table>'
+  ].join("\n");
+}
+
+function styleNlImg(img, align) {
+  const w = img.getAttribute("data-width");
+  img.removeAttribute("data-width");
+  img.removeAttribute("data-align");
+  let style = NL.img;
+  if (w) {
+    if (/%$/.test(w)) style += "width:" + w + ";";
+    else { img.setAttribute("width", w.replace(/px$/, "")); style += "width:" + w.replace(/px$/, "") + "px;"; }
+  }
+  if (align === "center") style += "margin-left:auto;margin-right:auto;";
+  else if (align === "right") style += "margin-left:auto;";
+  img.setAttribute("style", style);
+}
+
+/* ==========================================================================
+   PRETTY PRINT  (readable indentation of block tags; inline stays inline)
+   - text nodes are re-escaped on output
+   - <pre> content is emitted verbatim (no injected whitespace)
+   ========================================================================== */
+const BLOCK = new Set(["h1","h2","h3","h4","p","ul","ol","li","blockquote","pre",
+  "hr","figure","figcaption","table","tr","td"]);
+const VOID = new Set(["hr","br","img"]);
+
+function attrStr(node) {
+  return Array.from(node.attributes)
+    .map(a => " " + a.name + '="' + a.value.replace(/&/g, "&amp;").replace(/"/g, "&quot;") + '"')
+    .join("");
+}
+function escText(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function pad(d) { return "  ".repeat(d); }
+
+/* Emit a node and its descendants with no added whitespace (for <pre>). */
+function verbatim(node) {
+  let out = "";
+  node.childNodes.forEach(n => {
+    if (n.nodeType === 3) out += escText(n.textContent);
+    else if (n.nodeType === 1) {
+      const tag = n.tagName.toLowerCase();
+      out += "<" + tag + attrStr(n) + ">" + verbatim(n) + "</" + tag + ">";
+    }
+  });
+  return out;
+}
+
+function prettyHtml(root) {
+  function ser(node, depth) {
+    let out = "";
+    node.childNodes.forEach(n => {
+      if (n.nodeType === 3) {
+        out += escText(n.textContent.replace(/\s+/g, " "));
+      } else if (n.nodeType === 1) {
+        const tag = n.tagName.toLowerCase();
+        const attrs = attrStr(n);
+        if (tag === "pre") { out += "\n" + pad(depth) + "<pre" + attrs + ">" + verbatim(n) + "</pre>"; return; }
+        if (VOID.has(tag)) { if (BLOCK.has(tag)) out += "\n" + pad(depth); out += "<" + tag + attrs + ">"; return; }
+        if (BLOCK.has(tag)) {
+          out += "\n" + pad(depth) + "<" + tag + attrs + ">";
+          const inner = ser(n, depth + 1);
+          if (/\n/.test(inner)) out += inner + "\n" + pad(depth) + "</" + tag + ">";
+          else out += inner.replace(/^\s+|\s+$/g, "") + "</" + tag + ">";
+        } else {
+          out += "<" + tag + attrs + ">" + ser(n, depth) + "</" + tag + ">";
+        }
+      }
+    });
+    return out;
+  }
+  return ser(root, 0).replace(/^\n+/, "").replace(/[ \t]+\n/g, "\n").replace(/[ \t]+$/, "");
+}
+
+function indent(text, spaces) {
+  const pad = " ".repeat(spaces);
+  return text.split("\n").map(l => l ? pad + l : l).join("\n");
+}
+
+/* ==========================================================================
+   RENDER PIPELINE  (re-run on every change)
+   ========================================================================== */
+const editor = document.getElementById("editor");
+const previewInner = document.getElementById("previewInner");
+const htmlout = document.getElementById("htmlout");
+const modeLabel = document.getElementById("modeLabel");
+
+let currentHtml = ""; // mode-specific HTML used by the copy buttons
+
+function render() {
+  const root = neutralDoc(editor.value);
+  // Collect any mermaid sources so we can render them asynchronously.
+  const sources = Array.from(root.querySelectorAll("figure[data-mermaid]"))
+                       .map(f => decMermaid(f.getAttribute("data-mermaid")));
+  if (MODE === "newsletter") {
+    currentHtml = serializeNewsletter(root);
+    // Preview shows the email exactly (inline styles carry the look).
+    previewInner.innerHTML = currentHtml;
+    previewInner.classList.remove("article");
+  } else {
+    currentHtml = serializeLinkedIn(root);
+    // Preview uses the app's article CSS to approximate the LinkedIn look.
+    previewInner.innerHTML = currentHtml;
+    previewInner.classList.add("article");
+  }
+  htmlout.value = currentHtml;
+  decoratePreviewDiagrams(); // add Download PNG / Copy image controls (preview only)
+  kickMermaid(sources);      // render any not-yet-cached diagrams, then re-render
+}
+
+/* ---- Per-diagram controls in the preview ----------------------------- */
+/* The reliable way to get a diagram into a LinkedIn Article is their image
+   upload button, so each rendered diagram offers Download PNG / Copy image.
+   These are added to the live preview DOM only — never to the copied HTML. */
+function decoratePreviewDiagrams() {
+  const pngToIndex = new Map();
+  let n = 0;
+  for (const [, entry] of mermaidCache) if (entry.png) pngToIndex.set(entry.png, ++n);
+
+  previewInner.querySelectorAll("img").forEach(img => {
+    const idx = pngToIndex.get(img.getAttribute("src"));
+    if (!idx) return;
+    const fig = img.closest("figure") || img.parentElement;
+    if (!fig || fig.querySelector(".diagram-tools")) return;
+    fig.style.position = "relative";
+    const bar = document.createElement("div");
+    bar.className = "diagram-tools";
+    bar.append(
+      mkBtn("Download PNG", () => downloadDataUrl(img.src, "diagram-" + idx + ".png")),
+      mkBtn("Copy image", () => copyImage(img.src))
+    );
+    fig.appendChild(bar);
+  });
+}
+function mkBtn(label, onClick) {
+  const b = document.createElement("button");
+  b.className = "btn"; b.type = "button"; b.textContent = label;
+  b.addEventListener("click", onClick);
+  return b;
+}
+function downloadDataUrl(dataUrl, filename) {
+  const a = document.createElement("a");
+  a.href = dataUrl; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  toast("Saved " + filename + " — upload it via LinkedIn’s image button");
+}
+async function copyImage(dataUrl) {
+  try {
+    const blob = await (await fetch(dataUrl)).blob();
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+    toast("Diagram image copied to clipboard");
+  } catch (e) {
+    toast("This browser can’t copy images — use Download PNG instead", true);
+  }
+}
+
+/* Debounce so typing stays snappy on large documents. */
+let renderTimer = null;
+function scheduleRender() {
+  clearTimeout(renderTimer);
+  renderTimer = setTimeout(render, 120);
+}
+editor.addEventListener("input", scheduleRender);
+
+/* ==========================================================================
+   MODE TOGGLE
+   ========================================================================== */
+const btnLinkedIn = document.getElementById("modeLinkedIn");
+const btnNewsletter = document.getElementById("modeNewsletter");
+function setMode(mode) {
+  MODE = mode;
+  const ln = mode === "linkedin";
+  btnLinkedIn.setAttribute("aria-pressed", ln);
+  btnNewsletter.setAttribute("aria-pressed", !ln);
+  modeLabel.textContent = ln ? "LinkedIn Article" : "Newsletter";
+  render();
+}
+btnLinkedIn.addEventListener("click", () => setMode("linkedin"));
+btnNewsletter.addEventListener("click", () => setMode("newsletter"));
+
+/* ==========================================================================
+   COPY  (rich content + raw HTML, with fallbacks for file:// contexts)
+   ========================================================================== */
+function htmlToPlain(html) {
+  const d = new DOMParser().parseFromString(html, "text/html");
+  return (d.body.textContent || "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+async function copyRich(html) {
+  // Preferred path: Async Clipboard API with both html + plain flavours.
+  try {
+    if (navigator.clipboard && window.ClipboardItem) {
+      await navigator.clipboard.write([new ClipboardItem({
+        "text/html": new Blob([html], { type: "text/html" }),
+        "text/plain": new Blob([htmlToPlain(html)], { type: "text/plain" })
+      })]);
+      return true;
+    }
+  } catch (e) { /* fall through */ }
+
+  // Fallback: select a hidden rich element and execCommand("copy").
+  const holder = document.createElement("div");
+  holder.setAttribute("contenteditable", "true");
+  holder.style.cssText = "position:fixed;left:-99999px;top:0;white-space:normal;";
+  holder.innerHTML = html;
+  document.body.appendChild(holder);
+  const range = document.createRange();
+  range.selectNodeContents(holder);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+  sel.removeAllRanges();
+  holder.remove();
+  return ok;
+}
+
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) { /* fall through */ }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.cssText = "position:fixed;left:-99999px;top:0;";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+  ta.remove();
+  return ok;
+}
+
+document.getElementById("copyRich").addEventListener("click", async () => {
+  const ok = await copyRich(currentHtml);
+  toast(ok ? "Rendered content copied — paste into your editor" : "Copy failed — try Ctrl/Cmd-C from the preview", !ok);
+});
+document.getElementById("copyHtml").addEventListener("click", async () => {
+  const ok = await copyText(currentHtml);
+  toast(ok ? "Raw HTML copied" : "Copy failed — select the HTML pane and copy manually", !ok);
+});
+
+/* ==========================================================================
+   IMAGES  (paste, drag-drop, file picker -> base64; managed in the panel)
+   ========================================================================== */
+function fileToDataUrl(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.onerror = () => rej(r.error);
+    r.readAsDataURL(file);
+  });
+}
+
+async function ingestFiles(fileList) {
+  const files = Array.from(fileList).filter(f => f.type.startsWith("image/"));
+  for (const f of files) {
+    try {
+      const dataUrl = await fileToDataUrl(f);
+      const id = nextImageId();
+      const alt = (f.name || "image").replace(/\.[^.]+$/, "");
+      images.set(id, { dataUrl, alt, width: "", align: "", caption: "" });
+      insertAtCursor("![" + alt + "](img:" + id + ")");
+    } catch (e) { toast("Could not read image", true); }
+  }
+  renderImagePanel();
+  render();
+  if (images.size) openImagePanel();
+}
+
+function insertAtCursor(text) {
+  const start = editor.selectionStart, end = editor.selectionEnd;
+  const v = editor.value;
+  const before = v.slice(0, start);
+  // Put block images on their own line so they render as a figure.
+  const prefix = (before === "" || before.endsWith("\n\n") || before.endsWith("\n")) ? "" : "\n\n";
+  const insertion = prefix + text + "\n";
+  editor.value = before + insertion + v.slice(end);
+  const pos = start + insertion.length;
+  editor.selectionStart = editor.selectionEnd = pos;
+  editor.focus();
+}
+
+/* Paste & drag-drop on the editor */
+editor.addEventListener("paste", (e) => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  const imgFiles = [];
+  for (const it of items) if (it.kind === "file" && it.type.startsWith("image/")) imgFiles.push(it.getAsFile());
+  if (imgFiles.length) { e.preventDefault(); ingestFiles(imgFiles); }
+});
+["dragenter", "dragover"].forEach(ev =>
+  editor.addEventListener(ev, (e) => { e.preventDefault(); editor.classList.add("dragover"); }));
+["dragleave", "drop"].forEach(ev =>
+  editor.addEventListener(ev, (e) => { e.preventDefault(); editor.classList.remove("dragover"); }));
+editor.addEventListener("drop", (e) => {
+  if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) ingestFiles(e.dataTransfer.files);
+});
+
+/* File-picker button */
+document.getElementById("addImage").addEventListener("click", () => {
+  const input = document.createElement("input");
+  input.type = "file"; input.accept = "image/*"; input.multiple = true;
+  input.addEventListener("change", () => ingestFiles(input.files));
+  input.click();
+});
+
+/* ---- Image panel UI -------------------------------------------------- */
+const imgPanel = document.getElementById("imgPanel");
+const imgList = document.getElementById("imgList");
+const imgEmpty = document.getElementById("imgEmpty");
+const imgCount = document.getElementById("imgCount");
+const toggleImgPanel = document.getElementById("toggleImgPanel");
+
+function openImagePanel() { imgPanel.classList.remove("collapsed"); toggleImgPanel.textContent = "hide"; }
+toggleImgPanel.addEventListener("click", () => {
+  const collapsed = imgPanel.classList.toggle("collapsed");
+  toggleImgPanel.textContent = collapsed ? "show" : "hide";
+});
+
+function renderImagePanel() {
+  imgCount.textContent = images.size ? "(" + images.size + ")" : "";
+  imgEmpty.style.display = images.size ? "none" : "";
+  imgList.innerHTML = "";
+  for (const [id, meta] of images) {
+    const card = document.createElement("div");
+    card.className = "img-card";
+    card.innerHTML =
+      '<img src="' + meta.dataUrl + '" alt="">' +
+      '<div class="img-fields">' +
+        '<div class="full row" style="justify-content:space-between">' +
+          '<span class="ref">img:' + id + '</span>' +
+          '<button class="btn ghost" data-act="del" style="padding:2px 8px">remove</button>' +
+        '</div>' +
+        '<label>Alt text</label><label>Caption</label>' +
+        '<input data-f="alt" value="' + escAttr(meta.alt) + '" placeholder="describe the image">' +
+        '<input data-f="caption" value="' + escAttr(meta.caption) + '" placeholder="(optional)">' +
+        '<label>Width</label><label>Align</label>' +
+        '<input data-f="width" value="' + escAttr(meta.width) + '" placeholder="e.g. 400 or 60%">' +
+        '<select data-f="align">' +
+          opt("", "default", meta.align) + opt("left", "left", meta.align) +
+          opt("center", "center", meta.align) + opt("right", "right", meta.align) +
+        '</select>' +
+        '<button class="btn full" data-act="insert" style="padding:4px 8px;margin-top:2px">Insert reference into editor</button>' +
+      '</div>';
+
+    card.querySelectorAll("input,select").forEach(el => {
+      el.addEventListener("input", () => {
+        meta[el.getAttribute("data-f")] = el.value.trim();
+        render();
+      });
+    });
+    card.querySelector('[data-act="del"]').addEventListener("click", () => {
+      images.delete(id); renderImagePanel(); render();
+    });
+    card.querySelector('[data-act="insert"]').addEventListener("click", () => {
+      insertAtCursor("![" + (meta.alt || "image") + "](img:" + id + ")"); render();
+    });
+    imgList.appendChild(card);
+  }
+}
+function escAttr(s) { return String(s || "").replace(/"/g, "&quot;"); }
+function opt(val, label, current) {
+  return '<option value="' + val + '"' + (val === (current || "") ? " selected" : "") + ">" + label + "</option>";
+}
+
+/* ==========================================================================
+   CLEAR / RESET
+   ========================================================================== */
+document.getElementById("clearAll").addEventListener("click", () => {
+  if (!confirm("Clear the editor and remove all stored images?")) return;
+  editor.value = "";
+  images.clear();
+  renderImagePanel();
+  render();
+  editor.focus();
+});
+
+/* ==========================================================================
+   MOBILE TABS  (show one pane at a time on narrow screens)
+   ========================================================================== */
+const panes = Array.from(document.querySelectorAll(".pane"));
+const tabBtns = Array.from(document.querySelectorAll("#tabs button"));
+function showTab(idx) {
+  panes.forEach((p, i) => { p.hidden = (i !== idx); });
+  tabBtns.forEach((b, i) => b.setAttribute("aria-pressed", i === idx));
+}
+tabBtns.forEach((b, i) => b.addEventListener("click", () => showTab(i)));
+
+const mq = window.matchMedia("(max-width: 980px)");
+function applyResponsive() {
+  if (mq.matches) { showTab(0); }              // tabbed: editor first
+  else { panes.forEach(p => p.hidden = false); } // wide: show all three
+}
+mq.addEventListener ? mq.addEventListener("change", applyResponsive) : mq.addListener(applyResponsive);
+
+/* ==========================================================================
+   TOAST
+   ========================================================================== */
+const toastEl = document.getElementById("toast");
+let toastTimer = null;
+function toast(msg, isErr) {
+  toastEl.textContent = msg;
+  toastEl.classList.toggle("err", !!isErr);
+  toastEl.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2600);
+}
+
+/* ==========================================================================
+   SAMPLE DOCUMENT  (loaded by default)
+   ========================================================================== */
+const SAMPLE = `# Shipping the Right Thing
+
+A short, opinionated note on why **making the right thing the easy thing** beats
+gatekeeping every single time.
+
+## The problem with gates
+
+When quality lives in a *review queue* instead of the *workspace*, you get three
+predictable failures:
+
+1. Reviewers become a bottleneck
+2. People route around the gate
+3. The standard drifts because nobody reads the 80-page PDF
+
+> If the easy path and the correct path are the same path, compliance stops being
+> a battle and becomes the default.
+
+## What good looks like
+
+- Standards enforced *where the work happens*, not after the fact
+- Tooling that does the boring part for you
+  - templates that pre-fill the right metadata
+  - validation that runs as you save
+  - sensible defaults baked in
+- A short feedback loop — measured in seconds, not days
+
+### A quick example
+
+Here's the difference in one line of config:
+
+\`\`\`powershell
+# Before: hope everyone remembers the naming rule
+# After:  enforce it at the source
+Set-PWNamingRule -Pattern '[Role]-[Table][Code]-[Presentation]-[Description]'
+\`\`\`
+
+Inline code like \`Get-OIDCToken\` and ~~hand-rolled OAuth~~ render cleanly too.
+
+## How the pieces fit
+
+\`\`\`mermaid
+flowchart LR
+  A[Markdown] --> B{Parse}
+  B --> C[LinkedIn HTML]
+  B --> D[Newsletter HTML]
+  C --> E[Paste into Article]
+  D --> F[Copy raw HTML]
+\`\`\`
+
+Diagrams are rendered to PNG so they survive LinkedIn and email. Hover the
+diagram in the preview to download or copy the image.
+
+---
+
+## Try it yourself
+
+Read [the write-up](https://example.com), then steal the parts that fit. The goal
+isn't a bigger template — it's a smaller gap between *intent* and *result*.
+
+![Replace this sample image with your own — paste or drag one in](https://placehold.co/600x300/0e6b5c/ffffff?text=Drop+your+image+here){width=100% caption="Swap me out: use the Images panel for local files."}
+`;
+
+/* ==========================================================================
+   INIT
+   ========================================================================== */
+editor.value = SAMPLE;
+renderImagePanel();
+render();
+applyResponsive();
+</script>
+</body>
+</html>
